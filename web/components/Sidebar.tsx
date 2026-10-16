@@ -4,10 +4,16 @@ const NAV: { href: string | null; label: string }[] = [
   { href: "/", label: "Dashboard" },
   { href: "/drivers/DA1", label: "Drivers" },
   { href: "/head-to-head", label: "Head-to-Head" },
+  { href: "/teams", label: "Teams" },
+  { href: "/cars", label: "Cars" },
+  { href: "/circuits", label: "Circuits" },
+  { href: "/races", label: "Races" },
+  { href: "/tyres", label: "Tyres" },
+  { href: "/telemetry", label: "Telemetry" },
+  { href: "/strategy", label: "Strategy" },
+  { href: "/season-analysis", label: "Season Analysis" },
+  { href: "/predictions", label: "Predictions" },
   { href: "/methodology", label: "Methodology" },
-  { href: null, label: "Teams" }, { href: null, label: "Cars" }, { href: null, label: "Circuits" },
-  { href: null, label: "Races" }, { href: null, label: "Telemetry" }, { href: null, label: "Tyres" },
-  { href: null, label: "Strategy" }, { href: null, label: "Season Analysis" }, { href: null, label: "Predictions" },
 ];
 
 export default function Sidebar() {

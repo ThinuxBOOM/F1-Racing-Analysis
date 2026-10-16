@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 import metrics as m
 from datasource import get_source
@@ -17,9 +18,20 @@ from analysis.consistency import consistency, RELIABILITY_NOTE
 from analysis.decomposition import decompose, driver_effects
 from analysis.quality import quality_report
 from analysis.methodology import METRICS, BY_ID
+from analysis.teams import team_summary, ASSUMPTIONS as TEAM_ASSUMPTIONS
+from analysis.tyres import tyre_report
+from analysis.season import season_standings, circuit_characteristics
+from analysis.telemetry import detect_corners, corner_deltas
+from analysis.fuel import estimate_fuel, FALLBACK_FUEL
+from analysis.mixed import mixed_with_intervals
+from analysis.verdict import verdict_panel
+from analysis.strategy import strategy_table, undercuts
+from analysis.reliability import weather_effect, reliability, development
+from analysis.predictions import predict_round
 
 app = FastAPI(title="F1 Performance Analytics API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_methods=["GET"])
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 SRC = get_source()
 RACE_LIKE = ("R", "S")
 
@@ -179,3 +191,279 @@ def pit_stops(season: int, rnd: int):
 
 @app.get("/methodology")
 def methodology(): return dict(meta=meta(), metrics=METRICS)
+
+
+@app.get("/teams/{season}/{rnd}/{kind}")
+def teams(season: int, rnd: int, kind: str):
+    """Per-team aggregates: observed points/positions + MODEL ESTIMATE car pace."""
+    df = prepared(season, rnd, kind)
+    res = SRC.results(season, rnd, kind)
+    rows = team_summary(df, res)
+    return dict(meta=meta(), teams=rows, assumptions=TEAM_ASSUMPTIONS,
+                label="Car pace is a MODEL ESTIMATE (mean of tyre-adjusted driver effects). Points/positions are observed.")
+
+
+@app.get("/tyres/{season}/{rnd}/{kind}")
+def tyres(season: int, rnd: int, kind: str):
+    """Per-compound pace offsets (adjusted) and degradation. Offsets are MODEL ESTIMATES."""
+    df = prepared(season, rnd, kind)
+    return dict(meta=meta(), compounds=tyre_report(df),
+                label="Adjusted offsets remove driver/car/tyre-age mix; raw medians do not.",
+                method=BY_ID.get("tyre_compound"))
+
+
+@app.get("/standings/{season}")
+def standings(season: int):
+    """Season driver and team standings from observed results across all rounds."""
+    ev = SRC.events(season)
+    if ev.empty:
+        raise HTTPException(404, f"no events for season {season}")
+    frames = []
+    for r in ev["round"].tolist():
+        try:
+            frames.append(SRC.results(season, int(r), "R"))
+        except Exception:
+            continue
+    return dict(meta=meta(), standings=season_standings(frames))
+
+
+@app.get("/circuits/{season}")
+def circuits(season: int):
+    """Data-derived circuit characteristics per round. Braking/full-throttle need telemetry."""
+    ev = SRC.events(season)
+    if ev.empty:
+        raise HTTPException(404, f"no events for season {season}")
+    out = []
+    for _, e in ev.iterrows():
+        rnd = int(e["round"])
+        try:
+            df = prepared(season, rnd, "R")
+        except HTTPException:
+            try:
+                df = prepared(season, rnd, "Q")
+            except HTTPException:
+                continue
+        # reliable stint slopes for mean degradation
+        deg_rows = []
+        for (_, _st), g in df.groupby(["driver", "stint_number"]):
+            s = m.stint_degradation(g)
+            import math
+            if s["n_clean"] >= 8 and s["deg"] == s["deg"] and s["deg_se"] == s["deg_se"]:
+                deg_rows.append(dict(deg_s_per_lap=float(s["deg"]), reliable=True))
+        out.append(circuit_characteristics(dict(
+            circuit=e.get("circuit"), name=e.get("name"), round=rnd,
+            length_km=None if pd.isna(e.get("length_km")) else float(e.get("length_km")),
+            total_laps=None if pd.isna(e.get("total_laps")) else int(e.get("total_laps"))), df, deg_rows))
+    return dict(meta=meta(), circuits=out)
+
+
+@app.get("/races/{season}/{rnd}")
+def races(season: int, rnd: int):
+    """Combined race header for the Races page: event, results, pits, quality flags."""
+    ev = SRC.events(season)
+    row = ev[ev["round"] == rnd]
+    if row.empty:
+        raise HTTPException(404, f"no event for {season} round {rnd}")
+    e = row.iloc[0].to_dict()
+    clean_e = {k: (None if (isinstance(v, float) and np.isnan(v)) else v) for k, v in e.items()}
+    try:
+        df = prepared(season, rnd, "R")
+        kind_used = "R"
+    except HTTPException:
+        df = prepared(season, rnd, "Q")
+        kind_used = "Q"
+    res = SRC.results(season, rnd, kind_used)
+    q = quality_report(df, _total_laps(season, rnd, df) if kind_used in RACE_LIKE else None)
+    pits = SRC.pit_stops(season, rnd)
+    return dict(meta=meta(), event={k: _clean(v) for k, v in clean_e.items()},
+                kind=kind_used, results=_records(res), pit_stops=_records(pits),
+                quality=q)
+
+
+@app.get("/telemetry/{season}/{rnd}/{kind}/{driver}/{lap}")
+def telemetry(season: int, rnd: int, kind: str, driver: str, lap: int):
+    """Distance-aligned telemetry for one lap + detected corners.
+
+    Samples are on a 25 m grid for payload size (storage is 5 m). Corner
+    detection is generic and works on real FastF1 traces.
+    """
+    if not hasattr(SRC, "telemetry"):
+        raise HTTPException(501, "telemetry not supported by this data source")
+    tele = SRC.telemetry(season, rnd, kind, driver, int(lap))  # type: ignore[attr-defined]
+    if tele is None or len(tele) == 0:
+        raise HTTPException(404, f"no telemetry for {driver} lap {lap}")
+    corners = detect_corners(tele)
+    slim = tele[["distance_m", "speed", "throttle", "brake", "gear", "drs", "x", "y"]]
+    return dict(meta=meta(), driver=driver, lap=int(lap),
+                samples=_records(slim), corners=corners,
+                label="Synthetic trace on mock source; measured trace on FastF1 source. Corners are detected, not official.")
+
+
+@app.get("/corner-deltas/{season}/{rnd}/{kind}/{a}/{lap_a}/{b}/{lap_b}")
+def corner_deltas_route(season: int, rnd: int, kind: str, a: str, lap_a: int, b: str, lap_b: int):
+    """Per-corner entry/apex/exit + time deltas between two laps (B - A)."""
+    if not hasattr(SRC, "telemetry"):
+        raise HTTPException(501, "telemetry not supported by this data source")
+    ta = SRC.telemetry(season, rnd, kind, a, int(lap_a))  # type: ignore[attr-defined]
+    tb = SRC.telemetry(season, rnd, kind, b, int(lap_b))  # type: ignore[attr-defined]
+    if ta is None or len(ta) == 0 or tb is None or len(tb) == 0:
+        raise HTTPException(404, "one or both laps have no telemetry")
+    d = corner_deltas(ta, tb, label_a=f"{a} lap {lap_a}", label_b=f"{b} lap {lap_b}")
+    return dict(meta=meta(), result=d, method=BY_ID.get("corner_analysis"))
+
+
+def _frames_with_fuel(season: int, kind: str = "R") -> tuple[dict[int, pd.DataFrame], dict[int, dict]]:
+    """Prepared frames per round, refuel-corrected with per-circuit estimate where reliable."""
+    return _frames_with_fuel_cached(season, kind)
+
+
+@lru_cache(maxsize=8)
+def _frames_with_fuel_cached(season: int, kind: str) -> tuple[dict[int, pd.DataFrame], dict[int, dict]]:
+    ev = SRC.events(season)
+    frames: dict[int, pd.DataFrame] = {}
+    fuels: dict[int, dict] = {}
+    for r in ev["round"].tolist():
+        rnd = int(r)
+        try:
+            df = prepared(season, rnd, kind)
+        except HTTPException:
+            continue
+        laps = SRC.laps(season, rnd, kind)
+        total = _total_laps(season, rnd, laps)
+        fest = estimate_fuel(df, total)
+        fuels[rnd] = fest
+        if fest.get("reliable") and fest.get("fuel_s_per_lap"):
+            f = float(fest["fuel_s_per_lap"])
+            df = df.copy()
+            df["fuel_corr_time_s"] = df["lap_time_s"] - f * (total - df["lap_number"])
+            df["fuel_used_s_per_lap"] = f
+        else:
+            df = df.copy()
+            df["fuel_used_s_per_lap"] = FALLBACK_FUEL
+        frames[rnd] = df
+    if not frames:
+        raise HTTPException(404, f"no {kind} laps for season {season}")
+    return frames, fuels
+
+
+@app.get("/fuel/{season}/{rnd}")
+def fuel_route(season: int, rnd: int, kind: str = "R"):
+    """Per-circuit fuel-burn estimate with reliability flag. Falls back to 0.035."""
+    df = prepared(season, rnd, kind)
+    laps = SRC.laps(season, rnd, kind)
+    est = estimate_fuel(df, _total_laps(season, rnd, laps))
+    return dict(meta=meta(), round=rnd, kind=kind, estimate=est,
+                method=BY_ID.get("fuel_corrected_time"))
+
+
+@app.get("/mixed-effects/{season}")
+def mixed_effects(season: int, kind: str = "R"):
+    """Season driver/car ratings from the ridge mixed model with round-bootstrap intervals."""
+    return _mixed_cached(season, kind)
+
+
+@lru_cache(maxsize=8)
+def _mixed_cached(season: int, kind: str):
+    frames, fuels = _frames_with_fuel(season, kind)
+    res = mixed_with_intervals(frames)
+    if "error" in res:
+        raise HTTPException(404, res["error"])
+    return dict(meta=meta(), kind=kind, result=res, fuel_per_round=fuels,
+                method=BY_ID.get("mixed_effects"))
+
+
+@app.get("/verdict/{season}/{rnd}/{a}/{b}")
+def verdict(season: int, rnd: int, a: str, b: str):
+    """Ranked likely causes of the gap between two drivers, with evidence and confidence."""
+    df = prepared(season, rnd, "R")
+    d = decompose(df, a, b)
+    if "error" in d:
+        raise HTTPException(404, d["error"])
+    cons_list = consistency(df)
+    cons = {c["driver"]: c for c in cons_list}
+    q = quality_report(df, _total_laps(season, rnd, df))
+    try:
+        frames, _ = _frames_with_fuel(season, "R")
+        seas = mixed_with_intervals(frames, n_boot=120)
+        seas = None if "error" in seas else seas
+    except HTTPException:
+        seas = None
+    panel = verdict_panel(a, b, d, cons, q, seas)
+    return dict(meta=meta(), driver_a=a, driver_b=b, panel=panel,
+                adjusted_gap_s=d.get("adjusted_gap_s"), total_raw_gap_s=d.get("total_raw_gap_s"),
+                assumptions=d.get("assumptions", []))
+
+
+@app.get("/strategy/{season}/{rnd}")
+def strategy(season: int, rnd: int, kind: str = "R"):
+    """Pit strategy, undercuts and effectiveness for one race."""
+    df = prepared(season, rnd, kind)
+    res = SRC.results(season, rnd, kind)
+    pits = SRC.pit_stops(season, rnd)
+    return dict(meta=meta(), strategies=strategy_table(df, res, pits),
+                undercuts=undercuts(df),
+                label="Strategies and positions observed; effectiveness pace is tyre-adjusted estimate.")
+
+
+@app.get("/weather/{season}/{rnd}")
+def weather_route(season: int, rnd: int, kind: str = "R"):
+    """Weather-effect estimate: residual pace vs track temperature."""
+    df = prepared(season, rnd, kind)
+    try:
+        w = SRC.weather(season, rnd, kind)  # type: ignore[attr-defined]
+    except Exception:
+        w = None
+    eff = weather_effect(df, w)
+    sample = []
+    if w is not None and len(w):
+        ww = w.head(90)
+        sample = [{k: _clean(v) for k, v in r.items()} for r in ww.to_dict("records")]
+    return dict(meta=meta(), effect=eff, weather=sample,
+                method=BY_ID.get("weather_effect"))
+
+
+@app.get("/reliability/{season}")
+def reliability_route(season: int):
+    """DNF counts and laps-completed distribution across the season. Observed."""
+    ev = SRC.events(season)
+    frames = []
+    for r in ev["round"].tolist():
+        try:
+            frames.append(SRC.results(season, int(r), "R"))
+        except Exception:
+            continue
+    return dict(meta=meta(), reliability=reliability(frames))
+
+
+@app.get("/development/{season}")
+def development_route(season: int, kind: str = "R"):
+    """Per-round car gaps traced across the season with development slopes."""
+    ev = SRC.events(season)
+    per_round: dict[int, dict[str, dict]] = {}
+    for r in ev["round"].tolist():
+        rnd = int(r)
+        try:
+            df = prepared(season, rnd, kind)
+            res = SRC.results(season, rnd, kind)
+        except HTTPException:
+            continue
+        rows = team_summary(df, res, n_boot=80)
+        per_round[rnd] = {t["team"]: {"gap": t["gap_to_best_car_s"], "ci": t["gap_ci95_s"]}
+                          for t in rows}
+    return dict(meta=meta(), development=development(per_round),
+                method=BY_ID.get("season_development"))
+
+
+@app.get("/predictions/{season}/{rnd}")
+def predictions_route(season: int, rnd: int, kind: str = "R"):
+    """Leave-one-round-out predicted gaps with intervals + backtest MAE when observed."""
+    return _predictions_cached(season, int(rnd), kind)
+
+
+@lru_cache(maxsize=32)
+def _predictions_cached(season: int, rnd: int, kind: str):
+    frames, _ = _frames_with_fuel(season, kind)
+    res = predict_round(frames, int(rnd), n_boot=80)
+    if "error" in res:
+        raise HTTPException(404, res["error"])
+    return dict(meta=meta(), kind=kind, result=res, method=BY_ID.get("prediction"))

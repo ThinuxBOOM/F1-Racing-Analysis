@@ -8,7 +8,7 @@ analytics recover known answers. `truth` is never exposed through the API.
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from .base import LAP_COLUMNS, RESULT_COLUMNS, PIT_COLUMNS, EVENT_COLUMNS
+from .base import LAP_COLUMNS, RESULT_COLUMNS, PIT_COLUMNS, EVENT_COLUMNS, TELEMETRY_COLUMNS
 
 SEASON = 2099                     # obviously not a real season
 FUEL_S_PER_LAP = 0.035
@@ -65,6 +65,58 @@ class MockSource:
     def pit_stops(self, season, rnd):
         df = pd.DataFrame(self._pits, columns=PIT_COLUMNS)
         return df[df["round"] == rnd].copy()
+
+    def telemetry(self, season, rnd, kind, driver, lap_number):
+        """Synthetic distance-aligned telemetry for one lap (DEMO DATA).
+
+        Uses the circuit length and the hidden car/driver offsets so faster
+        packages show higher straight/apex speeds, with noise from the
+        driver's consistency level. Deterministic per (round, driver, lap).
+        """
+        from analysis.telemetry import synthesize_telemetry
+        laps = self.laps(season, rnd, kind)
+        row = laps[(laps["driver"] == driver) & (laps["lap_number"] == int(lap_number))]
+        if row.empty:
+            return pd.DataFrame(columns=TELEMETRY_COLUMNS)
+        ev = self.events(season)
+        erow = ev[ev["round"] == rnd]
+        circuit = str(erow["circuit"].iloc[0]) if len(erow) else "Demo Circuit"
+        length = float(erow["length_km"].iloc[0]) if len(erow) else 5.0
+        team, d_off, sd = DRIVERS.get(driver, ("?", 0.0, 0.15))
+        car_off = self.truth["car"].get(team, 0.0)
+        tele = synthesize_telemetry(
+            circuit, length, driver, int(lap_number), season, rnd,
+            car_bonus_kmh=-car_off * 20.0,
+            driver_apex_bonus_kmh=-d_off * 15.0,
+            noise_sd_kmh=max(float(sd) * 8.0, 0.6))
+        return tele
+
+    def weather(self, season, rnd, kind="R"):
+        """Deterministic synthetic per-minute weather (DEMO DATA, always dry).
+
+        Track warms ~6 C over the race with small noise so weather-effect
+        code has something plausible to chew on without inventing rain that
+        contradicts the lap data.
+        """
+        import hashlib
+        seed = int(hashlib.md5(f"wx{season}{rnd}".encode()).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
+        ev = self.events(season)
+        erow = ev[ev["round"] == rnd]
+        total = int(erow["total_laps"].iloc[0]) if len(erow) else 50
+        minutes = int(total * 1.5) + 10
+        base_air = 21.0 + rnd * 0.7
+        rows = []
+        for minute in range(minutes):
+            air = base_air + 1.8 * minute / max(minutes, 1) + rng.normal(0, 0.15)
+            track = air + 8.0 + 4.0 * np.sin(np.pi * minute / max(minutes, 1)) + rng.normal(0, 0.2)
+            rows.append(dict(minute=minute, air_temp_c=round(float(air), 1),
+                             track_temp_c=round(float(track), 1),
+                             humidity=round(float(55 - 0.05 * minute + rng.normal(0, 0.5)), 1),
+                             pressure_hpa=round(float(1013 + rng.normal(0, 0.4)), 1),
+                             wind_speed=round(float(8 + rng.normal(0, 1.2)), 1),
+                             wind_dir=int(rng.integers(0, 360)), rainfall=False))
+        return pd.DataFrame(rows)
 
     # ------------------------------------------------------------ generation
     def _build(self):

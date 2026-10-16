@@ -1,6 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import Sidebar from "@/components/Sidebar";
+import MobileNav from "@/components/MobileNav";
 import DemoBanner from "@/components/DemoBanner";
 import { api, Meta } from "@/lib/api";
 
@@ -17,6 +18,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="en">
       <body>
+        <MobileNav />
         <div className="flex min-h-screen">
           <Sidebar />
           <div className="min-w-0 flex-1">

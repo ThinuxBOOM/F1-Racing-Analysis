@@ -56,3 +56,23 @@ class PostgresSource:
         return df
     def results(self, season, rnd, kind): return self._q(RESULTS_Q, (season, rnd, kind))
     def pit_stops(self, season, rnd): return self._q(PITS_Q, (season, rnd))
+
+    def telemetry(self, season, rnd, kind, driver, lap_number):
+        sql = """SELECT t.distance_m, t.speed, t.throttle, t.brake, t.gear, t.drs, t.x, t.y
+          FROM telemetry t JOIN laps l ON l.lap_id=t.lap_id
+          JOIN entries e ON e.entry_id=l.entry_id JOIN drivers d ON d.driver_id=e.driver_id
+          JOIN sessions s ON s.session_id=e.session_id JOIN events ev ON ev.event_id=s.event_id
+          WHERE ev.season=%s AND ev.round=%s AND s.kind=%s AND d.code=%s AND l.lap_number=%s
+          ORDER BY t.distance_m"""
+        return self._q(sql, (season, rnd, kind, driver, int(lap_number)))
+
+    def weather(self, season, rnd, kind="R"):
+        sql = """SELECT w.minute, w.air_temp_c, w.track_temp_c, w.humidity,
+          w.pressure_hpa, w.wind_speed, w.wind_dir, w.rainfall
+          FROM weather w JOIN sessions s ON s.session_id=w.session_id
+          JOIN events ev ON ev.event_id=s.event_id
+          WHERE ev.season=%s AND ev.round=%s AND s.kind=%s ORDER BY w.minute"""
+        try:
+            return self._q(sql, (season, rnd, kind))
+        except Exception:
+            return __import__("pandas").DataFrame()

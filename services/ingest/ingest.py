@@ -8,7 +8,6 @@ Idempotent: re-running a session replaces its rows.
 """
 from __future__ import annotations
 import argparse, os, sys
-import fastf1
 import numpy as np
 import pandas as pd
 import psycopg
@@ -49,7 +48,8 @@ def upsert_event(cur, ev) -> int:
     return cur.fetchone()[0]
 
 
-def ingest_session(conn, season: int, rnd: int, kind: str) -> None:
+def ingest_session(conn, season: int, rnd: int, kind: str):
+    import fastf1
     ses = fastf1.get_session(season, rnd, KIND_TO_FASTF1[kind])
     ses.load(laps=True, telemetry=False, weather=True, messages=False)
     ev = ses.event
@@ -113,6 +113,94 @@ def ingest_session(conn, season: int, rnd: int, kind: str) -> None:
                              nn(x["Rainfall"])))
     conn.commit()
     print(f"ingested {season} R{rnd} {kind}: {len(ses.laps)} laps")
+    return session_id
+
+
+def resample_telemetry(car: pd.DataFrame, pos: pd.DataFrame, step_m: int = 5) -> pd.DataFrame:
+    """Resample FastF1 time-based telemetry onto a distance grid.
+
+    car: must contain Distance, Speed, Throttle, Brake, nGear, DRS, RPM.
+    pos: must contain Distance, X, Y. Both sorted by Distance.
+    Returns columns matching the telemetry table.
+    Pure function so it is unit-testable without FastF1.
+    """
+    car = car.sort_values("Distance").dropna(subset=["Distance"])
+    pos = pos.sort_values("Distance").dropna(subset=["Distance"])
+    if car.empty:
+        return pd.DataFrame(columns=["distance_m", "speed", "throttle", "brake",
+                                     "gear", "rpm", "drs", "x", "y"])
+    lo, hi = float(car["Distance"].min()), float(car["Distance"].max())
+    grid = np.arange(max(lo, 0), hi, step_m)
+    out = pd.DataFrame({"distance_m": grid})
+    for col, out_col in [("Speed", "speed"), ("Throttle", "throttle"),
+                         ("nGear", "gear"), ("DRS", "drs"), ("RPM", "rpm")]:
+        if col in car.columns:
+            out[out_col] = np.interp(grid, car["Distance"].to_numpy(float),
+                                     car[col].fillna(0).to_numpy(float))
+    if "Brake" in car.columns:
+        b = car["Brake"].to_numpy()
+        # FastF1 Brake is 0/1 or boolean
+        b_num = (b > 0).astype(float) if np.issubdtype(np.asarray(b).dtype, np.number) else b.astype(float)
+        out["brake"] = np.interp(grid, car["Distance"].to_numpy(float), b_num) > 0.5
+    else:
+        out["brake"] = False
+    for col, out_col in [("X", "x"), ("Y", "y")]:
+        if col in pos.columns and len(pos):
+            out[out_col] = np.interp(grid, pos["Distance"].to_numpy(float),
+                                     pos[col].fillna(0).to_numpy(float))
+        else:
+            out[out_col] = 0.0
+    return out
+
+
+def ingest_telemetry(conn, season: int, rnd: int, kind: str, session_id: int,
+                     max_drivers: int = 10, max_laps_per_driver: int = 3) -> int:
+    """Fetch car + position telemetry for a session's fastest laps and store
+    at 5 m steps. Idempotent per lap (deletes existing rows for the lap first).
+
+    Selects up to `max_laps_per_driver` fastest clean-ish laps per driver so
+    storage stays bounded (~5 km / 5 m = ~1000 rows per lap).
+    Returns number of telemetry rows written.
+    """
+    import fastf1
+    ses = fastf1.get_session(season, rnd, KIND_TO_FASTF1[kind])
+    ses.load(laps=True, telemetry=True, weather=False, messages=False)
+    total = 0
+    with conn.cursor() as cur:
+        for drv in ses.laps["Driver"].unique()[:max_drivers]:
+            dlaps = ses.laps.pick_drivers([drv]).sort_values("LapTime").head(max_laps_per_driver)
+            for _, l in dlaps.iterrows():
+                if pd.isna(l["LapNumber"]):
+                    continue
+                try:
+                    car = l.get_car_data()
+                    pos = l.get_pos_data()
+                except Exception as e:
+                    print(f"  telemetry skip {drv} lap {l['LapNumber']}: {e}")
+                    continue
+                grid = resample_telemetry(car, pos, step_m=TELEMETRY_STEP_M)
+                if grid.empty:
+                    continue
+                cur.execute("SELECT lap_id FROM laps l JOIN entries e ON e.entry_id=l.entry_id "
+                            "JOIN drivers d ON d.driver_id=e.driver_id "
+                            "WHERE e.session_id=%s AND d.code=%s AND l.lap_number=%s",
+                            (session_id, drv, int(l["LapNumber"])))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                lap_id = row[0]
+                cur.execute("DELETE FROM telemetry WHERE lap_id=%s", (lap_id,))
+                cur.executemany(
+                    "INSERT INTO telemetry VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [(int(lap_id), float(r.distance_m), float(r.speed), float(r.throttle),
+                      bool(r.brake), int(r.gear) if not pd.isna(r.gear) else None,
+                      int(r.rpm) if "rpm" in grid and not pd.isna(getattr(r, "rpm", None)) else None,
+                      int(r.drs) if not pd.isna(r.drs) else 0,
+                      float(r.x), float(r.y)) for r in grid.itertuples()])
+                total += len(grid)
+    conn.commit()
+    print(f"telemetry: {season} R{rnd} {kind}: {total} samples")
+    return total
 
 
 def main() -> None:
@@ -121,10 +209,15 @@ def main() -> None:
     ap.add_argument("--round", type=int)
     ap.add_argument("--all-rounds", action="store_true")
     ap.add_argument("--sessions", nargs="+", default=["R", "Q"])
+    ap.add_argument("--telemetry", action="store_true",
+                    help="also ingest car/position telemetry for fastest laps (5 m grid)")
+    ap.add_argument("--telemetry-only", action="store_true",
+                    help="only ingest telemetry for already-ingested sessions")
     a = ap.parse_args()
 
     cache = os.getenv("FASTF1_CACHE", "./.fastf1-cache")
     os.makedirs(cache, exist_ok=True)
+    import fastf1
     fastf1.Cache.enable_cache(cache)
 
     rounds = [a.round]
@@ -138,7 +231,21 @@ def main() -> None:
         for rnd in rounds:
             for kind in a.sessions:
                 try:
-                    ingest_session(conn, a.season, rnd, kind)
+                    if a.telemetry_only:
+                        cur = conn.cursor()
+                        cur.execute("SELECT s.session_id FROM sessions s JOIN events ev ON ev.event_id=s.event_id "
+                                    "WHERE ev.season=%s AND ev.round=%s AND s.kind=%s",
+                                    (a.season, rnd, kind))
+                        row = cur.fetchone()
+                        cur.close()
+                        if not row:
+                            print(f"skip telemetry {a.season} R{rnd} {kind}: session not ingested")
+                            continue
+                        ingest_telemetry(conn, a.season, rnd, kind, int(row[0]))
+                    else:
+                        sid = ingest_session(conn, a.season, rnd, kind)
+                        if a.telemetry:
+                            ingest_telemetry(conn, a.season, rnd, kind, sid)
                 except Exception as e:  # sprint/FP sessions may not exist every round
                     conn.rollback()
                     print(f"skip {a.season} R{rnd} {kind}: {e}")

@@ -2,6 +2,9 @@ import Link from "next/link";
 import { api, EventRow, Pace, Quality, Summary, f3, lapFmt, signed } from "@/lib/api";
 import Selectors from "@/components/Selectors";
 import PaceChart from "@/components/PaceChart";
+import Search from "@/components/Search";
+import FadeIn from "@/components/FadeIn";
+import LapTable from "@/components/LapTable";
 
 type SP = { season?: string; round?: string; kind?: string };
 
@@ -35,22 +38,37 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
         <h1 className="text-xl font-semibold">{ev?.name} <span className="text-mute">/ {ev?.circuit}</span></h1>
         <p className="mt-1 text-sm text-mute">{kind === "R" ? "Race" : "Qualifying"} analysis. Every figure is cleaned and fuel-corrected; see <Link className="underline" href="/methodology">Methodology</Link>.</p>
       </header>
-      <Selectors season={season} seasons={seasons} round={round} kind={kind} events={events} />
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <Selectors season={season} seasons={seasons} round={round} kind={kind} events={events} />
+        <Search season={season} round={round} kind={kind} />
+      </div>
 
+      <FadeIn>
       <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Kpi label={kind === "R" ? "Winner" : "Pole"} value={winner?.driver} sub={winner?.team} />
         <Kpi label="Best clean pace" value={bestPace?.driver} sub={lapFmt(bestPace?.median_clean_pace_s)} />
         <Kpi label="Sector leaders" value={Object.entries(sum.sector_leaders).map(([k, v]) => `${k.toUpperCase()} ${v}`).join("  ")} sub="best clean sector time" small />
         <Kpi label="Data completeness" value={`${(qual.report.mean_completeness * 100).toFixed(0)}%`} sub="laps surviving the clean filter" />
       </section>
+      </FadeIn>
 
+      <FadeIn delay={0.05}>
       <section className="card p-4">
         <h2 className="mb-3 text-sm font-medium">Pace by lap</h2>
         <PaceChart laps={pace.laps} field={pace.field_median} drivers={drivers} initial={drivers.slice(0, 3)} />
       </section>
+      </FadeIn>
 
+      <FadeIn delay={0.08}>
+      <section className="card p-4">
+        <h2 className="mb-3 text-sm font-medium">Lap explorer (virtualised)</h2>
+        <LapTable laps={pace.laps} />
+      </section>
+      </FadeIn>
+
+      <FadeIn delay={0.1}>
       <section className="card overflow-x-auto">
-        <table className="w-full text-sm">
+        <table className="w-full min-w-[720px] text-sm">
           <thead className="label text-left"><tr>
             {["Pos", "Driver", "Team", "Grid", "Best lap", "Gap", "Adj. pace gap", "Consistency", "vs teammate (95% CI)"].map((h) => <th key={h} className="px-3 py-2 font-normal">{h}</th>)}
           </tr></thead>
@@ -76,6 +94,7 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
           Adj. pace gap and teammate gap come from a model that removes fuel, compound and tyre-age effects from clean laps (raw medians are not comparable across tyre strategies). Negative teammate gap = this driver faster; an interval spanning zero means no clear difference (hover for the reading). Consistency is a single-session, field-relative score and is noisy: differences under about 25 points are not meaningful. Best lap is raw.
         </p>
       </section>
+      </FadeIn>
 
       {qual.report.flags.length > 0 && (
         <section className="card border-warn/40 p-4 text-sm text-warn">

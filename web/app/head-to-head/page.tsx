@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { api, Decomp, EventRow, Summary, signed } from "@/lib/api";
+import type { VerdictItem } from "@/lib/api";
 import DecompBars from "@/components/DecompBars";
+import FadeIn from "@/components/FadeIn";
 
 type SP = { season?: string; round?: string; a?: string; b?: string };
 
@@ -16,6 +18,7 @@ export default async function HeadToHead({ searchParams }: { searchParams: SP })
   const b = searchParams.b && codes.includes(searchParams.b) ? searchParams.b : codes[codes.length - 1];
   const res = a !== b ? await api<{ result: Decomp }>(`/driver-vs-car/${season}/${round}/${a}/${b}`) : null;
   const d = res?.result;
+  const verdict = a !== b ? await api<{ panel: VerdictItem[] }>(`/verdict/${season}/${round}/${a}/${b}`).catch(() => null) : null;
 
   return (
     <div className="space-y-6">
@@ -35,6 +38,7 @@ export default async function HeadToHead({ searchParams }: { searchParams: SP })
 
       {!d ? <div className="card p-4 text-sm text-mute">Pick two different drivers.</div> : (
         <>
+          <FadeIn>
           <section className="card p-4">
             <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
               <h2 className="text-sm font-medium">{d.driver_a} vs {d.driver_b}{d.same_team && <span className="ml-2 text-xs text-mute">(teammates: car part is zero by construction)</span>}</h2>
@@ -42,6 +46,25 @@ export default async function HeadToHead({ searchParams }: { searchParams: SP })
             </div>
             <DecompBars d={d} />
           </section>
+          </FadeIn>
+          {verdict && (
+            <FadeIn delay={0.05}>
+            <section className="card p-4">
+              <h2 className="mb-2 text-sm font-medium">Verdict panel — ranked causes</h2>
+              <ol className="space-y-2">
+                {verdict.panel.map((v) => (
+                  <li key={v.rank} className="flex items-start justify-between gap-3 border-t border-line pt-2 text-sm first:border-0 first:pt-0">
+                    <div>
+                      <span className="mr-2 font-medium">{v.rank}. {v.cause}</span>
+                      <span className={`rounded border px-1.5 py-0.5 text-[10px] uppercase ${v.confidence === "high" ? "border-ok/50 text-ok" : v.confidence === "medium" ? "border-warn/50 text-warn" : "border-line text-mute"}`}>{v.confidence}</span>
+                      <p className="mt-0.5 text-mute">{v.evidence}</p>
+                    </div>
+                  </li>))}
+              </ol>
+              <p className="mt-2 text-[11px] text-mute">Ranks explanations, never proves causation. Full method: <Link className="underline" href="/methodology#verdict_panel">Methodology</Link>.</p>
+            </section>
+            </FadeIn>
+          )}
           <section className="card p-4 text-sm">
             <div className="label mb-2">Assumptions behind this estimate</div>
             <ul className="list-disc space-y-1 pl-5 text-mute">{d.assumptions.map((x) => <li key={x}>{x}</li>)}</ul>

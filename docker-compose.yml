@@ -10,5 +10,22 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./db/002_extended.sql:/docker-entrypoint-initdb.d/02_extended.sql:ro
+  api:
+    build:
+      context: .
+      dockerfile: services/analytics/Dockerfile
+    environment:
+      DATA_SOURCE: ${DATA_SOURCE:-mock}
+      DATABASE_URL: postgresql://f1:f1@db:5432/f1
+    ports: ["8000:8000"]
+    depends_on: [db]
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      API_URL: http://api:8000
+    ports: ["3000:3000"]
+    depends_on: [api]
 volumes:
   pgdata:
